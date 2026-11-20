@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="fr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SV SOC Triage</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#0d1724;color:#e2ebf7;font:16px/1.5 system-ui}main{max-width:1100px;margin:auto;padding:30px 18px}header{padding:30px;border-left:4px solid #66e6c3;background:#152438}h1{font-size:clamp(35px,7vw,70px);line-height:1;margin:12px 0}.grid{display:grid;grid-template-columns:1fr 1.3fr;gap:18px;margin-top:18px}section{padding:20px;background:#152438;border-radius:12px}label{display:block;margin-top:10px}textarea{width:100%;background:#0d1724;color:inherit;padding:10px;border:1px solid #647891;border-radius:6px}button{font:inherit;background:#66e6c3;color:#0d1724;border:0;border-radius:6px;padding:8px 12px;margin:8px 5px 0 0;cursor:pointer}article{border-top:1px solid #647891;padding:10px 0;overflow-wrap:anywhere}strong{color:#66e6c3}h2{margin-top:0}li{margin-bottom:6px}@media(max-width:750px){.grid{grid-template-columns:1fr}}
+</style>
+<main>
+<header><span>SV · Khalid Aslaoui (SOOVENSO)</span><h1>SOC Triage</h1><p>Corréler les alertes Wazuh et les blocs pfSense à partir de journaux locaux.</p></header>
+<div class="grid"><section><h2>Journaux JSONL</h2>
+<label for="wazuh">Alertes Wazuh</label><textarea id="wazuh" rows="6" spellcheck="false"></textarea>
+<label for="firewall">Événements pfSense normalisés</label><textarea id="firewall" rows="6" spellcheck="false"></textarea>
+<button id="demo">Charger la démo</button><button id="run">Analyser</button><button id="export" disabled>Exporter JSON</button>
+<p id="status" role="status"></p></section>
+<section><h2>Événements à vérifier</h2><div id="results"></div></section></div>
+</main>
+<script>
+const byId = id => document.getElementById(id);
+const validIp = value => typeof value === 'string' && /^(0|[1-9]\d{0,2})(\.(0|[1-9]\d{0,2})){3}$/.test(value) && value.split('.').every(n => Number(n) <= 255);
+function parse(input, source) {
+  if (input.length > 2_000_000) throw Error('Maximum 2 Mo de texte par source.');
+  const events = [], errors = [];
+  input.split(/\r?\n/).forEach((line,index) => {
+    if (!line.trim()) return;
+    try {
+      const row = JSON.parse(line);
+      const ip = source === 'Wazuh' ? row.data?.srcip : row.src_ip;
+      const when = Date.parse(row.timestamp);
+      const level = row.rule?.level;
+      if (!validIp(ip) || !Number.isFinite(when) || !/(Z|[+-]\d{2}:?\d{2})$/i.test(row.timestamp)) throw Error();
+      if (source === 'Wazuh' && (!Number.isInteger(level) || level < 0 || level > 16)) throw Error();
+      if (source === 'pfSense' && !['pass','block'].includes(row.action)) throw Error();
+      events.push({source, ip, when, timestamp:new Date(when).toISOString(),
+        detail:source === 'Wazuh' ? String(row.rule.description || 'Alerte') : row.action,
+        ref:source + ' L' + (index+1), level});
+    } catch { errors.push(source + ' L' + (index+1)); }
+  });
+  return {events, errors};
+}
+function correlate(alerts, firewall) {
+  const blocks = new Map();
+  for (const event of firewall.filter(event => event.detail === 'block').sort((a,b) => a.when-b.when)) {
+    if (!blocks.has(event.ip)) blocks.set(event.ip, []);
+    blocks.get(event.ip).push(event);
+  }
+  return alerts.filter(event => event.level >= 7).map(alert => {
+    const group = blocks.get(alert.ip) || [];
+    let lo = 0, hi = group.length;
+    while (lo < hi) {
+      const mid = Math.floor((lo+hi)/2);
+      if (group[mid].when < alert.when-300000) lo = mid+1;
+      else hi = mid;
+    }
+    const block = group[lo];
+    return {alert, block: block && block.when <= alert.when+300000 ? block : null};
+  }).sort((a,b) => Number(Boolean(b.block))-Number(Boolean(a.block)) || b.alert.level-a.alert.level || b.alert.when-a.alert.when);
+}
+const demoWazuh = [
+  {timestamp:'2026-11-20T20:00:00Z',data:{srcip:'192.0.2.20'},rule:{level:10,description:'Plusieurs échecs de connexion (simulation)'}},
+  {timestamp:'2026-11-20T20:10:00Z',data:{srcip:'198.51.100.7'},rule:{level:8,description:'Alerte de surveillance (simulation)'}}
+];
+const demoFirewall = [
+  {timestamp:'2026-11-20T20:01:00Z',src_ip:'192.0.2.20',action:'block'},
+  {timestamp:'2026-11-20T20:11:00Z',src_ip:'198.51.100.7',action:'pass'}
+];
+let report;
+function render() {
+  byId('results').replaceChildren();
+  byId('export').disabled = true;
+  try {
+    const wazuh = parse(byId('wazuh').value,'Wazuh');
+    const firewall = parse(byId('firewall').value,'pfSense');
+    const results = correlate(wazuh.events,firewall.events);
+    const errors = [...wazuh.errors,...firewall.errors];
+    report = {results, errors};
+    byId('status').textContent = wazuh.events.length + ' alertes · ' + firewall.events.length + ' événements pare-feu · ' + errors.length + ' lignes rejetées' + (errors.length ? ' (' + errors.slice(0,12).join(', ') + (errors.length > 12 ? ', …' : '') + ')' : '');
+    for (const {alert,block} of results.slice(0,100)) {
+      const row = document.createElement('article'), title = document.createElement('strong'), info = document.createElement('div');
+      title.textContent = (block ? 'Corrélation à vérifier' : 'Alerte seule') + ' · ' + alert.ip;
+      info.textContent = alert.detail + ' · niveau ' + alert.level + ' · ' + alert.timestamp + ' · ' + alert.ref + (block ? ' ↔ ' + block.ref + ' ' + block.timestamp : '');
+      row.append(title, info);
+      byId('results').append(row);
+    }
+    if (!results.length) byId('results').textContent = 'Aucune alerte de niveau 7 ou plus.';
+    if (results.length > 100) byId('status').textContent += ' · 100 résultats affichés, export complet.';
+    byId('export').disabled = false;
+  } catch (error) { byId('status').textContent = error.message; }
+}
+byId('demo').onclick = () => {
+  byId('wazuh').value = demoWazuh.map(row => JSON.stringify(row)).join('\n');
+  byId('firewall').value = demoFirewall.map(row => JSON.stringify(row)).join('\n');
+  render();
+};
+byId('run').onclick = render;
+byId('export').onclick = () => {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'sv-soc-triage.json';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url),1000);
+};
+byId('demo').onclick();
+</script>
+</html>
